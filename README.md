@@ -1,3 +1,17 @@
+# 软件截图 v1.0.10
+
+<img width="1216" height="839" alt="image" src="https://github.com/user-attachments/assets/4b678588-cffd-4fca-b1f0-9fd34848e7a8" />
+
+<img width="1216" height="839" alt="image" src="https://github.com/user-attachments/assets/595a469d-5f3b-4753-b174-a565ca06f5cc" />
+
+<img width="1216" height="839" alt="image" src="https://github.com/user-attachments/assets/a0bbb899-3b65-450b-9f5c-4a19c5288b10" />
+
+<img width="1216" height="839" alt="image" src="https://github.com/user-attachments/assets/8db33b6b-7d1b-4cbe-91ed-d7669e53eb63" />
+
+<img width="1216" height="839" alt="image" src="https://github.com/user-attachments/assets/29829c66-8c61-4136-98ed-1a66e3679eb9" />
+
+
+
 # **《资料登记管理系统（Data Register Manager）用户与开发者全维度使用手册》**  
 **作者：杜玛**  
 **版本：1.0.10**  
