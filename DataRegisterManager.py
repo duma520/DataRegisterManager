@@ -30,28 +30,27 @@ from PySide6.QtWidgets import (
     QProgressBar, QStatusBar, QMenuBar, QMenu, QToolBar,
     QTreeWidget, QTreeWidgetItem, QDateTimeEdit, QDateEdit, QCalendarWidget,
     QScrollArea, QFrame, QStackedWidget, QInputDialog, QListWidget,
-    QListWidgetItem, QAbstractItemView, QStyleFactory, QApplication as QApp
+    QListWidgetItem, QAbstractItemView, QStyleFactory, QApplication as QApp,
+    QTableWidgetSelectionRange
 )
 from PySide6.QtCore import (
     Qt, Signal, QThread, QObject, QTimer, QDateTime, QDate, 
-    QSize, QSettings, QCoreApplication, QEvent, QMutex, QWaitCondition
+    QSize, QCoreApplication, QEvent, QMutex, QWaitCondition
 )
 from PySide6.QtGui import (
     QIcon, QFont, QColor, QPalette, QAction, QActionGroup, QKeySequence,
-    QStandardItemModel, QStandardItem, QPixmap, QDesktopServices
+    QStandardItemModel, QStandardItem, QPixmap, QDesktopServices,
+    QTextDocument, QTextCursor, QTextCharFormat, QTextBlockFormat, QBrush,
+    QUndoStack, QUndoCommand 
 )
 
 
 def get_app_dir() -> Path:
     """获取应用程序所在目录"""
     if getattr(sys, 'frozen', False):
-        # 打包后的exe
         app_dir = Path(sys.executable).parent
-        print(f"[路径信息] 打包模式 - 应用程序目录: {app_dir}")
     else:
-        # 开发环境
         app_dir = Path(__file__).parent
-        print(f"[路径信息] 开发模式 - 脚本所在目录: {app_dir}")
     return app_dir
 
 
@@ -95,53 +94,203 @@ def get_icon_path() -> Path:
         # 在应用程序目录查找
         icon_path = APP_DIR / icon_name
         if icon_path.exists():
-            print(f"[图标] 找到图标文件: {icon_path}")
             return icon_path
             
-        # 在脚本所在目录查找
         icon_path = Path(__file__).parent / icon_name
         if icon_path.exists():
-            print(f"[图标] 找到图标文件: {icon_path}")
             return icon_path
             
-    print(f"[图标] 未找到外部图标文件，使用默认图标")
     return None
 
 
 # 应用程序目录
 APP_DIR = get_app_dir()
-print(f"[路径信息] 最终应用程序目录: {APP_DIR}")
 
-# 配置常量
-APP_NAME = "资料登记管理系统"
-APP_VERSION = "1.0.0"
+
+# ==================== 项目信息元数据 ====================
+class ProjectInfo:
+    """项目信息元数据（集中管理所有项目相关信息）"""
+    VERSION = "3.0.0"
+    BUILD_DATE = "2026-08-20"
+    AUTHOR = "杜玛"
+    LICENSE = "GNU Affero General Public License v3.0"
+    COPYRIGHT = "© 永久 杜玛"
+    URL = "https://github.com/duma520/DataRegisterManager"
+    MAINTAINER_EMAIL = "不提供"
+    NAME = "资料登记管理系统"
+    DESCRIPTION = "资料登记管理系统（支持多用户、灵活的表格配置、数据搜索和自动备份）"
+    
+    @classmethod
+    def get_full_name(cls) -> str:
+        """获取完整的程序名称（带版本）"""
+        return f"{cls.NAME} v{cls.VERSION}"
+    
+    @classmethod
+    def get_full_title(cls, username: str = None) -> str:
+        """获取完整的窗口标题"""
+        base = f"{cls.get_full_name()} 构建:{cls.BUILD_DATE}"
+        if username:
+            return f"{base} - 当前用户: {username}"
+        return base
+    
+    @classmethod
+    def get_about_text(cls) -> str:
+        """获取关于信息文本"""
+        return f"""
+        <h2>{cls.NAME}</h2>
+        <p><b>版本:</b> {cls.VERSION}</p>
+        <p><b>构建日期:</b> {cls.BUILD_DATE}</p>
+        <p><b>作者:</b> {cls.AUTHOR}</p>
+        <p><b>版权:</b> {cls.COPYRIGHT}</p>
+        <p><b>许可证:</b> {cls.LICENSE}</p>
+        <p><b>项目主页:</b> <a href='{cls.URL}'>{cls.URL}</a></p>
+        <p><b>描述:</b> {cls.DESCRIPTION}</p>
+        """
+
+
+# 配置常量（使用 ProjectInfo 统一管理）
+APP_NAME = ProjectInfo.NAME
+APP_VERSION = ProjectInfo.VERSION
 BACKUP_DIR = APP_DIR / "backups"
 CONFIG_FILE = APP_DIR / "app_config.json"
 DB_FILE = APP_DIR / f"{APP_NAME.replace(' ', '_')}{'.db'}"
-
-print(f"\n[路径信息] 主要路径配置:")
-print(f"  - 应用程序目录: {APP_DIR}")
-print(f"  - 数据库文件路径: {DB_FILE}")
-print(f"  - 备份目录: {BACKUP_DIR}")
-print(f"  - 配置文件路径: {CONFIG_FILE}")
-
-# 检查路径是否存在或创建
-print(f"\n[路径检查] 目录状态:")
-print(f"  - 应用程序目录存在: {APP_DIR.exists()}")
-if not BACKUP_DIR.exists():
-    print(f"  - 备份目录不存在，将在首次备份时创建")
-else:
-    print(f"  - 备份目录存在: {BACKUP_DIR.exists()}")
+SETTINGS_FILE = APP_DIR / "settings.json"
 
 WAL_MODE = "WAL"  # WAL模式
-
 
 # 确保备份目录存在
 try:
     BACKUP_DIR.mkdir(exist_ok=True)
-    print(f"  - 备份目录已创建/确认: {BACKUP_DIR}")
 except Exception as e:
     print(f"  - 备份目录创建失败: {e}")
+
+
+# ==================== 应用设置管理（文件存储，避免注册表泄露） ====================
+class AppSettings:
+    """应用程序设置管理器
+    
+    将所有设置保存在程序目录下的 settings.json 文件中，
+    避免使用 QSettings 将数据写入 Windows 注册表，防止数据泄露。
+    """
+    
+    def __init__(self, file_path: Path = None):
+        self._file_path = file_path or SETTINGS_FILE
+        self._data: Dict[str, Any] = {}
+        self._load()
+    
+    def _load(self):
+        """从文件加载设置"""
+        if self._file_path.exists():
+            try:
+                with open(self._file_path, 'r', encoding='utf-8') as f:
+                    self._data = json.load(f)
+            except Exception as e:
+                print(f"[设置] 加载设置文件失败: {e}，使用默认设置")
+                self._data = {}
+        else:
+            self._data = {}
+    
+    def _save(self):
+        """保存设置到文件"""
+        try:
+            with open(self._file_path, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[设置] 保存设置文件失败: {e}")
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        """获取设置值"""
+        return self._data.get(key, default)
+    
+    def value(self, key: str, default: Any = None, type=None) -> Any:
+        """获取设置值（兼容 QSettings 接口）"""
+        val = self._data.get(key, default)
+        if type is not None and val is not None:
+            try:
+                return type(val)
+            except (ValueError, TypeError):
+                return default
+        return val
+    
+    def set(self, key: str, value: Any):
+        """设置设置值"""
+        self._data[key] = value
+        self._save()
+    
+    def setValue(self, key: str, value: Any):
+        """设置设置值（兼容 QSettings 接口）"""
+        self.set(key, value)
+    
+    def remove(self, key: str):
+        """移除设置项"""
+        self._data.pop(key, None)
+        self._save()
+    
+    def clear(self):
+        """清空所有设置"""
+        self._data.clear()
+        self._save()
+
+
+# ==================== 多线程后台工作器 ====================
+class BackgroundWorker(QThread):
+    """后台工作线程基类
+    
+    用于将耗时操作放到后台线程执行，避免阻塞 UI 主线程。
+    通过信号与主线程通信，确保 UI 更新的线程安全性。
+    """
+    
+    # 信号定义
+    started = Signal()                          # 任务开始
+    finished = Signal(object)                   # 任务完成，携带结果
+    progress = Signal(int, int)                 # 进度更新 (当前值, 最大值)
+    status = Signal(str)                        # 状态消息
+    error = Signal(str)                         # 错误消息
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._target = None
+        self._args = ()
+        self._kwargs = {}
+        self._is_cancelled = False
+        self._result = None
+        self._mutex = QMutex()
+    
+    def setup(self, target, *args, **kwargs):
+        """设置要执行的目标函数和参数"""
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs
+    
+    def run(self):
+        """在工作线程中执行任务"""
+        self._is_cancelled = False
+        self.started.emit()
+        try:
+            self._result = self._target(*self._args, **self._kwargs)
+            if not self._is_cancelled:
+                self.finished.emit(self._result)
+        except Exception as e:
+            if not self._is_cancelled:
+                error_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+                self.error.emit(error_msg)
+    
+    def cancel(self):
+        """取消任务"""
+        self._mutex.lock()
+        self._is_cancelled = True
+        self._mutex.unlock()
+        if self.isRunning():
+            self.quit()
+            self.wait(3000)
+    
+    def report_progress(self, current: int, maximum: int):
+        """报告进度（从工作函数中调用）"""
+        self.progress.emit(current, maximum)
+    
+    def report_status(self, msg: str):
+        """报告状态消息（从工作函数中调用）"""
+        self.status.emit(msg)
 
 
 # 单元格配置方案
@@ -229,8 +378,6 @@ class BackupManager:
         self.db_path = db_path
         self.backup_dir = BACKUP_DIR
         self.max_backups = 30
-        print(f"[备份管理器] 初始化 - 数据库路径: {db_path}")
-        print(f"[备份管理器] 备份目录: {self.backup_dir}")
         
     def create_backup(self, backup_type: str = "manual") -> Tuple[bool, str, Dict]:
         """创建数据库备份"""
@@ -241,8 +388,6 @@ class BackupManager:
             
             # 获取备份前信息
             source_size = os.path.getsize(self.db_path)
-            print(f"[备份] 创建 {backup_type} 备份: {backup_path}")
-            print(f"[备份] 源数据库大小: {source_size} 字节")
             
             # 创建备份
             shutil.copy2(self.db_path, backup_path)
@@ -257,8 +402,6 @@ class BackupManager:
                 "size": backup_size,
                 "datetime": datetime.now()
             }
-            
-            print(f"[备份] 备份成功，大小: {backup_size} 字节")
 
             # 清理旧备份
             self._cleanup_old_backups()
@@ -272,9 +415,7 @@ class BackupManager:
     def _cleanup_old_backups(self):
         """清理旧备份"""
         backups = sorted(self.backup_dir.glob("*.db"), key=os.path.getmtime)
-        print(f"[备份] 当前备份数量: {len(backups)}, 最大保留: {self.max_backups}")
         while len(backups) > self.max_backups:
-            print(f"[备份] 删除旧备份: {backups[0]}")
             backups[0].unlink()
             backups.pop(0)
             
@@ -346,11 +487,9 @@ class BackupManager:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             rollback_name = f"rollback_{timestamp}_before_restore.db"
             rollback_path = self.backup_dir / rollback_name
-            print(f"[恢复] 创建回滚备份: {rollback_path}")
             shutil.copy2(self.db_path, rollback_path)
             
             # 恢复备份
-            print(f"[恢复] 从备份恢复: {backup_path} -> {self.db_path}")
             shutil.copy2(backup_path, self.db_path)
             
             return True, rollback_name
@@ -372,27 +511,22 @@ class DatabaseManager:
         self.db_path = db_path
         self.connection = None
         self.cursor = None
-        print(f"[数据库管理器] 初始化 - 数据库路径: {db_path}")
-        print(f"[数据库管理器] 数据库文件是否存在: {os.path.exists(db_path)}")
+        self._lock = threading.Lock()  # 线程安全锁
         self._init_database()
         
     def _init_database(self):
         """初始化数据库"""
         try:
-            print(f"[数据库] 开始初始化数据库...")
             # 启用WAL模式
             self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
-            print(f"[数据库] 数据库连接已建立")
             
             self.connection.execute("PRAGMA journal_mode=WAL")
             wal_status = self.connection.execute("PRAGMA journal_mode").fetchone()[0]
-            print(f"[数据库] WAL模式状态: {wal_status}")
             
             self.connection.execute("PRAGMA synchronous=NORMAL")
             self.cursor = self.connection.cursor()
             
             # 创建基础表
-            print(f"[数据库] 创建数据表...")
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -440,14 +574,9 @@ class DatabaseManager:
             """)
             
             self.connection.commit()
-            print(f"[数据库] 数据表创建/确认完成")
             
             # 创建默认管理员用户（如果不存在）
             self._create_default_admin()
-            
-            # 显示数据库文件信息
-            db_size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
-            print(f"[数据库] 数据库文件大小: {db_size} 字节 ({db_size/1024:.2f} KB)")
             
         except Exception as e:
             print(f"[数据库] 初始化错误: {e}")
@@ -456,43 +585,39 @@ class DatabaseManager:
             
     def _create_default_admin(self):
         """创建默认管理员用户"""
-        print(f"[数据库] 检查默认管理员用户...")
         admin_exists = self.execute_query("SELECT id FROM users WHERE username = ?", ("admin",))
         if not admin_exists:
-            print(f"[数据库] 创建默认管理员用户...")
             # 默认密码: admin123
             default_password = hashlib.sha256("admin123".encode()).hexdigest()
             self.execute_update(
                 "INSERT INTO users (username, password, config) VALUES (?, ?, ?)",
                 ("admin", default_password, json.dumps({"cell_count": 6, "default_cell": {}, "auto_resize_columns": True}))
             )
-            print(f"[数据库] 默认管理员用户创建成功 (用户名: admin, 密码: admin123)")
-        else:
-            print(f"[数据库] 默认管理员用户已存在")
             
     def execute_query(self, query: str, params: tuple = ()) -> List[tuple]:
-        """执行查询"""
-        try:
-            self.cursor.execute(query, params)
-            return self.cursor.fetchall()
-        except Exception as e:
-            print(f"[数据库] 查询错误: {e}")
-            return []
+        """执行查询（线程安全）"""
+        with self._lock:
+            try:
+                self.cursor.execute(query, params)
+                return self.cursor.fetchall()
+            except Exception as e:
+                print(f"[数据库] 查询错误: {e}")
+                return []
             
     def execute_update(self, query: str, params: tuple = ()) -> bool:
-        """执行更新"""
-        try:
-            self.cursor.execute(query, params)
-            self.connection.commit()
-            return True
-        except Exception as e:
-            print(f"[数据库] 更新错误: {e}")
-            self.connection.rollback()
-            return False
+        """执行更新（线程安全）"""
+        with self._lock:
+            try:
+                self.cursor.execute(query, params)
+                self.connection.commit()
+                return True
+            except Exception as e:
+                print(f"[数据库] 更新错误: {e}")
+                self.connection.rollback()
+                return False
             
     def verify_user(self, username: str, password: str) -> Optional[Dict]:
         """验证用户登录（支持空密码）"""
-        print(f"[登录] 验证用户: {username}, 密码{'为空' if password == '' else '不为空'}")
         # 如果密码为空字符串，直接使用空字符串验证
         if password == "":
             result = self.execute_query(
@@ -508,15 +633,12 @@ class DatabaseManager:
             )
             
         if result:
-            print(f"[登录] 用户 {username} 验证成功")
             return {
                 "id": result[0][0],
                 "username": result[0][1],
                 "created_at": result[0][2],
                 "config": json.loads(result[0][3]) if result[0][3] else {}
             }
-        else:
-            print(f"[登录] 用户 {username} 验证失败")
         return None
         
     def get_user(self, username: str) -> Optional[Dict]:
@@ -551,7 +673,6 @@ class DatabaseManager:
         
     def create_user(self, username: str, password: str, config: Dict) -> bool:
         """创建用户（支持空密码）"""
-        print(f"[用户管理] 创建用户: {username}, 密码{'为空' if password == '' else '不为空'}")
         if password == "":
             # 空密码直接存储空字符串
             return self.execute_update(
@@ -568,7 +689,6 @@ class DatabaseManager:
         
     def delete_user(self, user_id: int) -> bool:
         """删除用户"""
-        print(f"[用户管理] 删除用户 ID: {user_id}")
         # 删除用户相关数据
         self.execute_update("DELETE FROM user_configs WHERE user_id = ?", (user_id,))
         self.execute_update("DELETE FROM data_records WHERE user_id = ?", (user_id,))
@@ -577,7 +697,6 @@ class DatabaseManager:
         
     def update_username(self, user_id: int, new_username: str) -> bool:
         """更新用户名"""
-        print(f"[用户管理] 更新用户名 ID: {user_id} -> {new_username}")
         return self.execute_update(
             "UPDATE users SET username = ? WHERE id = ?",
             (new_username, user_id)
@@ -585,7 +704,6 @@ class DatabaseManager:
         
     def update_user_password(self, user_id: int, new_password: str) -> bool:
         """更新用户密码（支持空密码）"""
-        print(f"[用户管理] 更新密码 ID: {user_id}, 新密码{'为空' if new_password == '' else '不为空'}")
         if new_password == "":
             # 空密码直接存储空字符串
             return self.execute_update(
@@ -602,7 +720,6 @@ class DatabaseManager:
         
     def update_user_config(self, user_id: int, config: Dict) -> bool:
         """更新用户配置"""
-        print(f"[用户管理] 更新配置 ID: {user_id}")
         return self.execute_update(
             "UPDATE users SET config = ? WHERE id = ?",
             (json.dumps(config), user_id)
@@ -612,7 +729,6 @@ class DatabaseManager:
         """获取所有用户（不包含密码）"""
         results = self.execute_query("SELECT id, username, created_at FROM users ORDER BY id")
         users = [{"id": r[0], "username": r[1], "created_at": r[2]} for r in results]
-        print(f"[用户管理] 获取用户列表，共 {len(users)} 个用户")
         return users
         
     def save_cell_config(self, user_id: int, cell_index: int, config: CellConfig) -> bool:
@@ -702,8 +818,51 @@ class DatabaseManager:
     def close(self):
         """关闭数据库连接"""
         if self.connection:
-            print(f"[数据库] 关闭数据库连接")
             self.connection.close()
+
+
+class CellEditCommand(QUndoCommand):
+    """单元格编辑命令"""
+    
+    def __init__(self, table_widget, cell_index, row, col, old_text, new_text, description=""):
+        super().__init__(description)
+        self.table_widget = table_widget
+        self.cell_index = cell_index
+        self.row = row
+        self.col = col
+        self.old_text = old_text
+        self.new_text = new_text
+        
+    def undo(self):
+        """撤销操作"""
+        self.table_widget._set_cell_text(self.row, self.col, self.old_text)
+        
+    def redo(self):
+        """重做操作"""
+        self.table_widget._set_cell_text(self.row, self.col, self.new_text)
+
+
+class BatchEditCommand(QUndoCommand):
+    """批量编辑命令（用于粘贴等操作）"""
+    
+    def __init__(self, table_widget, changes, description=""):
+        """
+        changes: [(row, col, old_text, new_text), ...]
+        """
+        super().__init__(description)
+        self.table_widget = table_widget
+        self.changes = changes
+        
+    def undo(self):
+        """撤销操作"""
+        for row, col, old_text, _ in self.changes:
+            self.table_widget._set_cell_text(row, col, old_text)
+            
+    def redo(self):
+        """重做操作"""
+        for row, col, _, new_text in self.changes:
+            self.table_widget._set_cell_text(row, col, new_text)
+
 
 
 class DataTableWidget(QTableWidget):
@@ -711,6 +870,7 @@ class DataTableWidget(QTableWidget):
     
     data_changed = Signal(int, int, int, str)  # cell_index, row, col, content
     resize_requested = Signal()  # 请求调整列宽
+    paste_extended = Signal(int, int, int)  # cell_index, new_rows, new_cols - 粘贴扩展信号
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -718,15 +878,728 @@ class DataTableWidget(QTableWidget):
         self.user_id = None
         self.cell_index = None
         self.auto_resize_columns = True
+        self.highlight_keyword = None
+        self._clipboard_data = []  # 存储剪贴板数据（用于重复粘贴）
+        self._clipboard_rows = 0
+        self._clipboard_cols = 0
+        self._undo_stack = QUndoStack(self)  # 撤销堆栈
+        self._is_programmatic_change = False  # 标记是否为程序化修改
+        self._old_text_before_edit = ""  # 记录编辑前的文本
         self.setup_ui()
+        self.setup_clipboard_shortcuts()
+        self.setup_undo_shortcuts()
         
     def setup_ui(self):
         """设置UI"""
         self.setAlternatingRowColors(True)
+        # 支持多选（Ctrl+点击多选，Shift+点击范围选择）
         self.setSelectionBehavior(QTableWidget.SelectItems)
-        self.setSelectionMode(QTableWidget.SingleSelection)
+        self.setSelectionMode(QTableWidget.ExtendedSelection)
         self.itemChanged.connect(self.on_item_changed)
         
+    def setup_clipboard_shortcuts(self):
+        """设置剪贴板快捷键"""
+        # 复制 Ctrl+C
+        copy_action = QAction("复制", self)
+        copy_action.setShortcut(QKeySequence.Copy)
+        copy_action.triggered.connect(self.copy_selected)
+        self.addAction(copy_action)
+        
+        # 剪切 Ctrl+X
+        cut_action = QAction("剪切", self)
+        cut_action.setShortcut(QKeySequence.Cut)
+        cut_action.triggered.connect(self.cut_selected)
+        self.addAction(cut_action)
+        
+        # 粘贴 Ctrl+V
+        paste_action = QAction("粘贴", self)
+        paste_action.setShortcut(QKeySequence.Paste)
+        paste_action.triggered.connect(self.paste_from_clipboard)
+        self.addAction(paste_action)
+        
+        # 也添加右键菜单支持
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+        
+    def setup_undo_shortcuts(self):
+        """设置撤销/重做快捷键"""
+        # 撤销 Ctrl+Z
+        undo_action = self._undo_stack.createUndoAction(self, "撤销")
+        undo_action.setShortcut(QKeySequence.Undo)
+        self.addAction(undo_action)
+        
+        # 重做 Ctrl+Y 或 Ctrl+Shift+Z
+        redo_action = self._undo_stack.createRedoAction(self, "重做")
+        redo_action.setShortcuts([QKeySequence.Redo, QKeySequence("Ctrl+Y")])
+        self.addAction(redo_action)
+        
+    def _set_cell_text(self, row, col, text):
+        """程序化设置单元格文本（不触发撤销）"""
+        if 0 <= row < self.rowCount() and 0 <= col < self.columnCount():
+            item = self.item(row, col)
+            if not item:
+                item = QTableWidgetItem()
+                self.setItem(row, col, item)
+            
+            self._is_programmatic_change = True
+            item.setText(text)
+            self._is_programmatic_change = False
+            self.apply_highlight_to_item(item)
+        
+    def show_context_menu(self, pos):
+        """显示右键菜单"""
+        menu = QMenu(self)
+        
+        # 撤销/重做
+        undo_action = self._undo_stack.createUndoAction(self, "撤销\tCtrl+Z")
+        menu.addAction(undo_action)
+        
+        redo_action = self._undo_stack.createRedoAction(self, "重做\tCtrl+Y")
+        menu.addAction(redo_action)
+        
+        menu.addSeparator()
+        
+        copy_action = menu.addAction("复制\tCtrl+C")
+        copy_action.triggered.connect(self.copy_selected)
+        copy_action.setEnabled(len(self.selectedRanges()) > 0)
+        
+        cut_action = menu.addAction("剪切\tCtrl+X")
+        cut_action.triggered.connect(self.cut_selected)
+        cut_action.setEnabled(len(self.selectedRanges()) > 0)
+        
+        menu.addSeparator()
+        
+        paste_action = menu.addAction("粘贴（覆盖）\tCtrl+V")
+        paste_action.triggered.connect(self.paste_from_clipboard)
+        paste_action.setEnabled(self._can_paste())
+        
+        paste_insert_action = menu.addAction("粘贴（插入新行列）")
+        paste_insert_action.triggered.connect(self.paste_with_insert)
+        paste_insert_action.setEnabled(self._can_paste())
+        
+        menu.addSeparator()
+        
+        clear_action = menu.addAction("清除选中内容\tDelete")
+        clear_action.triggered.connect(self.clear_selected)
+        clear_action.setEnabled(len(self.selectedRanges()) > 0)
+        
+        menu.addSeparator()
+        
+        # 添加行列操作
+        insert_row_action = menu.addAction("在当前位置插入行")
+        insert_row_action.triggered.connect(self.insert_row_at_current)
+        
+        insert_col_action = menu.addAction("在当前位置插入列")
+        insert_col_action.triggered.connect(self.insert_col_at_current)
+        
+        delete_row_action = menu.addAction("删除当前行")
+        delete_row_action.triggered.connect(self.delete_current_row)
+        
+        delete_col_action = menu.addAction("删除当前列")
+        delete_col_action.triggered.connect(self.delete_current_col)
+        
+        menu.exec(self.mapToGlobal(pos))
+        
+    def keyPressEvent(self, event):
+        """处理键盘事件，支持Delete键清除和Ctrl+Z/Y"""
+        if event.key() == Qt.Key_Delete:
+            self.clear_selected()
+        elif event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
+            # 回车键开始编辑当前单元格
+            current = self.currentItem()
+            if current:
+                self.editItem(current)
+        else:
+            super().keyPressEvent(event)
+    
+    def get_all_selected_ranges(self) -> List[Tuple[int, int, int, int]]:
+        """获取所有选中的区域（支持多个不连续区域）
+        
+        Returns:
+            List of (top_row, bottom_row, left_col, right_col)
+        """
+        ranges = []
+        for sel_range in self.selectedRanges():
+            top_row = sel_range.topRow()
+            bottom_row = sel_range.bottomRow()
+            left_col = sel_range.leftColumn()
+            right_col = sel_range.rightColumn()
+            ranges.append((top_row, bottom_row, left_col, right_col))
+        return ranges
+    
+    def get_selected_data(self) -> tuple:
+        """获取选中区域的数据（支持多个不连续区域）
+        
+        Returns:
+            tuple: (all_data, min_row, min_col)
+                all_data: 列表，包含 (data_matrix, start_row, start_col) 元组
+                min_row: 所有选中区域的最小行号
+                min_col: 所有选中区域的最小列号
+        """
+        ranges = self.get_all_selected_ranges()
+        if not ranges:
+            return [], -1, -1
+        
+        min_row = min(r[0] for r in ranges)
+        min_col = min(r[2] for r in ranges)
+        
+        all_data = []
+        for top_row, bottom_row, left_col, right_col in ranges:
+            data = []
+            for row in range(top_row, bottom_row + 1):
+                row_data = []
+                for col in range(left_col, right_col + 1):
+                    item = self.item(row, col)
+                    row_data.append(item.text() if item else "")
+                data.append(row_data)
+            all_data.append((data, top_row, left_col))
+        
+        return all_data, min_row, min_col
+    
+    def copy_selected(self):
+        """复制选中内容到剪贴板"""
+        all_data, _, _ = self.get_selected_data()
+        if not all_data:
+            return False
+        
+        # 对于多个区域，使用特殊分隔符
+        text_parts = []
+        for data, _, _ in all_data:
+            text_parts.append(self._data_to_tsv(data))
+        
+        # 多个区域用双换行 + 特殊标记分隔
+        if len(text_parts) > 1:
+            text = "\n\n---SELECTION_SEPARATOR---\n\n".join(text_parts)
+        else:
+            text = text_parts[0] if text_parts else ""
+        
+        # 复制到剪贴板
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        
+        # 同时保存内部剪贴板（用于后续粘贴操作）
+        self._store_clipboard_data(all_data)
+        
+        return True
+    
+    def _store_clipboard_data(self, all_data):
+        """存储剪贴板数据到内部缓存"""
+        if not all_data:
+            return
+        
+        # all_data 是 [(data_matrix, start_row, start_col), ...] 的列表
+        # 先找到最小行列作为基准
+        min_row = min(rd[1] for rd in all_data)  # rd[1] 是 start_row
+        min_col = min(rd[2] for rd in all_data)  # rd[2] 是 start_col
+        
+        # 计算最大行列
+        max_row = max(rd[1] + len(rd[0]) - 1 for rd in all_data)
+        max_col = max(rd[2] + (len(rd[0][0]) - 1 if rd[0] and rd[0][0] else 0) for rd in all_data)
+        
+        rows = max_row - min_row + 1
+        cols = max_col - min_col + 1
+        
+        # 创建空矩阵
+        matrix = [[""] * cols for _ in range(rows)]
+        
+        # 填充数据
+        for data, start_row, start_col in all_data:
+            for i, row_data in enumerate(data):
+                for j, value in enumerate(row_data):
+                    matrix_row = start_row - min_row + i
+                    matrix_col = start_col - min_col + j
+                    if 0 <= matrix_row < rows and 0 <= matrix_col < cols:
+                        matrix[matrix_row][matrix_col] = value
+        
+        self._clipboard_data = matrix
+        self._clipboard_rows = rows
+        self._clipboard_cols = cols
+    
+    def cut_selected(self):
+        """剪切选中内容（支持撤销）"""
+        all_data, _, _ = self.get_selected_data()
+        if not all_data:
+            return False
+        
+        # 先复制
+        self.copy_selected()
+        
+        # 记录所有更改
+        changes = []
+        for data, start_row, start_col in all_data:
+            for i, row_data in enumerate(data):
+                for j, value in enumerate(row_data):
+                    if value:  # 只清空非空的单元格
+                        row = start_row + i
+                        col = start_col + j
+                        item = self.item(row, col)
+                        old_text = item.text() if item else ""
+                        changes.append((row, col, old_text, ""))
+        
+        if changes:
+            # 创建批量编辑命令
+            command = BatchEditCommand(self, changes, f"剪切 {len(changes)} 个单元格")
+            self._undo_stack.push(command)
+            
+            # 执行清空操作
+            self.blockSignals(True)
+            for row, col, old_text, _ in changes:
+                item = self.item(row, col)
+                if item:
+                    item.setText("")
+                else:
+                    new_item = QTableWidgetItem("")
+                    self.setItem(row, col, new_item)
+            self.blockSignals(False)
+            
+            # 触发数据变更信号
+            for row, col, _, _ in changes:
+                self.data_changed.emit(
+                    self.cell_index if self.cell_index is not None else -1,
+                    row, col, ""
+                )
+        
+        return True
+    
+    def paste_from_clipboard(self, insert_mode: bool = False):
+        """从剪贴板粘贴数据
+        
+        Args:
+            insert_mode: 如果为True，则在需要时插入新行列
+        """
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        
+        if not text:
+            # 尝试使用内部剪贴板数据
+            if self._clipboard_data:
+                return self._paste_internal_data(insert_mode)
+            return False
+        
+        # 检查是否有多区域分隔符
+        if "---SELECTION_SEPARATOR---" in text:
+            parts = text.split("\n\n---SELECTION_SEPARATOR---\n\n")
+            # 只使用第一个区域进行粘贴（简化处理）
+            data = self._tsv_to_data(parts[0])
+        else:
+            # 解析TSV数据
+            data = self._tsv_to_data(text)
+        
+        if not data:
+            return False
+        
+        return self._do_paste(data, insert_mode)
+    
+    def _paste_internal_data(self, insert_mode: bool = False) -> bool:
+        """使用内部缓存的剪贴板数据进行粘贴"""
+        if not self._clipboard_data:
+            return False
+        return self._do_paste(self._clipboard_data, insert_mode)
+    
+    def paste_with_insert(self):
+        """粘贴数据，在需要时插入新行/列"""
+        return self.paste_from_clipboard(insert_mode=True)
+    
+    def _do_paste(self, data: List[List[str]], insert_mode: bool = False) -> bool:
+        """执行粘贴操作（支持撤销）
+        
+        Args:
+            data: 要粘贴的二维数据
+            insert_mode: 是否在超出范围时插入行/列
+        """
+        if not data:
+            return False
+        
+        paste_rows = len(data)
+        paste_cols = len(data[0]) if data else 0
+        
+        # 【关键修复】获取当前选中区域的左上角作为粘贴起始位置
+        ranges = self.selectedRanges()
+        if ranges:
+            # 使用选中区域的左上角作为粘贴起始位置
+            start_row = ranges[0].topRow()
+            start_col = ranges[0].leftColumn()
+        else:
+            # 如果没有选中区域，尝试使用当前单元格
+            current_item = self.currentItem()
+            if current_item:
+                start_row = current_item.row()
+                start_col = current_item.column()
+            else:
+                # 如果都没有，从第一个单元格开始
+                start_row = 0
+                start_col = 0
+        
+        # 记录更改前的值（用于撤销）
+        changes = []
+        
+        # 检查是否超出表格范围
+        max_row = start_row + paste_rows
+        max_col = start_col + paste_cols
+        
+        need_expand = max_row > self.rowCount() or max_col > self.columnCount()
+        
+        if need_expand:
+            if insert_mode:
+                # 插入模式：自动扩展表格
+                self._expand_table(max_row, max_col)
+                # 发送扩展信号
+                if hasattr(self, 'paste_extended'):
+                    self.paste_extended.emit(
+                        self.cell_index if self.cell_index is not None else -1,
+                        max(self.rowCount(), max_row),
+                        max(self.columnCount(), max_col)
+                    )
+            else:
+                # 覆盖模式：询问用户
+                reply = QMessageBox.question(
+                    self,
+                    "粘贴范围超出",
+                    f"粘贴内容将超出表格范围\n\n"
+                    f"当前表格: {self.rowCount()}行 × {self.columnCount()}列\n"
+                    f"粘贴起始: 第{start_row+1}行 第{start_col+1}列\n"
+                    f"需要范围: {paste_rows}行 × {paste_cols}列\n\n"
+                    f"是否扩展表格？（是=扩展表格，否=裁剪数据，取消=不粘贴）",
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+                )
+                
+                if reply == QMessageBox.Cancel:
+                    return False
+                elif reply == QMessageBox.Yes:
+                    # 扩展表格
+                    self._expand_table(max_row, max_col)
+                    if hasattr(self, 'paste_extended'):
+                        self.paste_extended.emit(
+                            self.cell_index if self.cell_index is not None else -1,
+                            max(self.rowCount(), max_row),
+                            max(self.columnCount(), max_col)
+                        )
+                else:
+                    # 裁剪数据以适应表格
+                    data = self._clip_data_to_table(data, start_row, start_col)
+                    if not data:
+                        return False
+                    paste_rows = len(data)
+                    paste_cols = len(data[0]) if data else 0
+        
+        # 收集更改信息
+        self.blockSignals(True)
+        for i in range(paste_rows):
+            for j in range(paste_cols):
+                target_row = start_row + i
+                target_col = start_col + j
+                
+                if target_row < self.rowCount() and target_col < self.columnCount():
+                    value = data[i][j] if i < len(data) and j < len(data[i]) else ""
+                    
+                    # 获取旧值
+                    item = self.item(target_row, target_col)
+                    if not item:
+                        old_text = ""
+                        item = QTableWidgetItem()
+                        self.setItem(target_row, target_col, item)
+                    else:
+                        old_text = item.text()
+                    
+                    # 如果值有变化，记录下来
+                    if old_text != value:
+                        changes.append((target_row, target_col, old_text, value))
+                    
+                    item.setText(value)
+                    self.apply_highlight_to_item(item)
+        self.blockSignals(False)
+        
+        # 创建撤销命令
+        if changes:
+            command = BatchEditCommand(self, changes, f"粘贴 {paste_rows}×{paste_cols} 数据")
+            self._undo_stack.push(command)
+        
+        # 选择粘贴的区域
+        self.clearSelection()
+        self.setRangeSelected(
+            QTableWidgetSelectionRange(start_row, start_col, 
+                                       start_row + paste_rows - 1, 
+                                       start_col + paste_cols - 1),
+            True
+        )
+        
+        # 批量发送数据变更信号
+        for row, col, _, new_text in changes:
+            if new_text:  # 只发送非空的变更
+                self.data_changed.emit(
+                    self.cell_index if self.cell_index is not None else -1,
+                    row, col, new_text
+                )
+        
+        # 如果启用自动调整列宽，请求调整
+        if self.auto_resize_columns:
+            for col in range(start_col, start_col + paste_cols):
+                self.resizeColumnToContents(col)
+        
+        return True
+    
+    def clear_selected(self):
+        """清除选中单元格的内容（支持撤销和多区域）"""
+        all_data, min_row, min_col = self.get_selected_data()
+        if not all_data:
+            return
+        
+        # 计算总单元格数
+        total_cells = sum(len(data) * (len(data[0]) if data else 0) 
+                         for data, _, _ in all_data)
+        
+        reply = QMessageBox.question(
+            self,
+            "确认清除",
+            f"确定要清除选中的 {total_cells} 个单元格的内容吗？\n"
+            f"（选中了 {len(all_data)} 个区域）",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # 记录更改
+        changes = []
+        for data, start_row, start_col in all_data:
+            for i, row_data in enumerate(data):
+                for j, value in enumerate(row_data):
+                    if value:  # 只清除非空的单元格
+                        row = start_row + i
+                        col = start_col + j
+                        item = self.item(row, col)
+                        old_text = item.text() if item else ""
+                        changes.append((row, col, old_text, ""))
+        
+        if changes:
+            # 创建撤销命令
+            command = BatchEditCommand(self, changes, f"清除 {len(changes)} 个单元格")
+            self._undo_stack.push(command)
+            
+            # 执行清除
+            self.blockSignals(True)
+            for row, col, old_text, _ in changes:
+                item = self.item(row, col)
+                if item:
+                    item.setText("")
+            self.blockSignals(False)
+            
+            # 触发数据变更信号
+            for row, col, _, _ in changes:
+                self.data_changed.emit(
+                    self.cell_index if self.cell_index is not None else -1,
+                    row, col, ""
+                )
+
+    def insert_row_at_current(self):
+        """在当前选中位置插入一行"""
+        current_item = self.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "提示", "请先选择一个单元格")
+            return
+        
+        insert_row = current_item.row()
+        self.insertRow(insert_row)
+        
+        # 为新行初始化空项目
+        for col in range(self.columnCount()):
+            item = QTableWidgetItem("")
+            self.setItem(insert_row, col, item)
+        
+        # 更新行配置
+        if self.cell_config:
+            self.cell_config.row_count = self.rowCount()
+    
+    def insert_col_at_current(self):
+        """在当前选中位置插入一列"""
+        current_item = self.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "提示", "请先选择一个单元格")
+            return
+        
+        insert_col = current_item.column()
+        self.insertColumn(insert_col)
+        
+        # 为新列初始化空项目
+        for row in range(self.rowCount()):
+            item = QTableWidgetItem("")
+            self.setItem(row, insert_col, item)
+        
+        # 更新列标题
+        if self.cell_config and self.cell_config.require_title:
+            title = self.cell_config.get_column_title(insert_col)
+            header_item = QTableWidgetItem(title)
+            self.setHorizontalHeaderItem(insert_col, header_item)
+        
+        # 更新列配置
+        if self.cell_config:
+            self.cell_config.col_count = self.columnCount()
+    
+    def delete_current_row(self):
+        """删除当前行"""
+        current_item = self.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "提示", "请先选择一个单元格")
+            return
+        
+        if self.rowCount() <= 1:
+            QMessageBox.warning(self, "提示", "表格至少保留一行")
+            return
+        
+        row = current_item.row()
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除第 {row+1} 行吗？\n该行的所有数据将被清除！",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.removeRow(row)
+            if self.cell_config:
+                self.cell_config.row_count = self.rowCount()
+    
+    def delete_current_col(self):
+        """删除当前列"""
+        current_item = self.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "提示", "请先选择一个单元格")
+            return
+        
+        if self.columnCount() <= 1:
+            QMessageBox.warning(self, "提示", "表格至少保留一列")
+            return
+        
+        col = current_item.column()
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除第 {col+1} 列吗？\n该列的所有数据将被清除！",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.removeColumn(col)
+            if self.cell_config:
+                self.cell_config.col_count = self.columnCount()
+
+    def _can_paste(self) -> bool:
+        """检查是否可以粘贴"""
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        has_external = bool(text) and self._is_valid_tsv(text)
+        has_internal = bool(self._clipboard_data)
+        return has_external or has_internal
+    
+    def _is_valid_tsv(self, text: str) -> bool:
+        """检查文本是否为有效的TSV格式"""
+        if not text:
+            return False
+        lines = text.strip().split('\n')
+        return len(lines) > 0
+    
+    def _data_to_tsv(self, data: List[List[str]]) -> str:
+        """将二维数据转换为TSV文本"""
+        lines = []
+        for row in data:
+            # 转义制表符和换行符
+            escaped_row = [cell.replace('\t', '\\t').replace('\n', '\\n') for cell in row]
+            lines.append('\t'.join(escaped_row))
+        return '\n'.join(lines)
+    
+    def _tsv_to_data(self, text: str) -> List[List[str]]:
+        """将TSV文本转换为二维数据"""
+        data = []
+        lines = text.strip().split('\n')
+        for line in lines:
+            # 分割并反转义
+            cells = line.split('\t')
+            unescaped_cells = [cell.replace('\\t', '\t').replace('\\n', '\n') for cell in cells]
+            data.append(unescaped_cells)
+        return data
+    
+    def _expand_table(self, needed_rows: int, needed_cols: int):
+        """扩展表格以容纳更多数据"""
+        current_rows = self.rowCount()
+        current_cols = self.columnCount()
+        
+        if needed_rows > current_rows:
+            self.setRowCount(needed_rows)
+            # 初始化新行 - 确保所有单元格都有 QTableWidgetItem
+            for row in range(current_rows, needed_rows):
+                for col in range(self.columnCount()):
+                    if not self.item(row, col):
+                        item = QTableWidgetItem("")
+                        self.setItem(row, col, item)
+        
+        if needed_cols > current_cols:
+            self.setColumnCount(needed_cols)
+            # 初始化新列
+            for col in range(current_cols, needed_cols):
+                # 为所有行创建空项目
+                for row in range(self.rowCount()):
+                    if not self.item(row, col):
+                        item = QTableWidgetItem("")
+                        self.setItem(row, col, item)
+                
+                # 为新列设置标题
+                if self.cell_config and self.cell_config.require_title:
+                    if self.cell_config.title_mode == TitleMode.UNIFIED.value:
+                        title = self.cell_config.title_text or ""
+                    else:
+                        title = self.cell_config.get_column_title(col)
+                    header_item = QTableWidgetItem(title)
+                    self.setHorizontalHeaderItem(col, header_item)
+    
+    def _clip_data_to_table(self, data: List[List[str]], start_row: int, start_col: int) -> List[List[str]]:
+        """裁剪数据以适应表格大小"""
+        max_rows = self.rowCount() - start_row
+        max_cols = self.columnCount() - start_col
+        
+        if max_rows <= 0 or max_cols <= 0:
+            return []
+        
+        clipped_data = []
+        for i, row in enumerate(data):
+            if i >= max_rows:
+                break
+            clipped_row = row[:max_cols]
+            clipped_data.append(clipped_row)
+        
+        return clipped_data
+
+    def on_item_changed(self, item: QTableWidgetItem):
+        """数据变化处理（添加撤销支持）"""
+        if self._is_programmatic_change:
+            return
+            
+        if item and self.user_id is not None and self.cell_index is not None:
+            row = item.row()
+            col = item.column()
+            new_text = item.text()
+            
+            self.apply_highlight_to_item(item)
+            
+            # 使用之前记录的旧文本创建撤销命令
+            old_text = self._old_text_before_edit
+            if old_text != new_text:
+                self._undo_stack.push(
+                    CellEditCommand(self, self.cell_index, row, col, 
+                                  old_text, new_text, f"编辑单元格 ({row+1},{col+1})")
+                )
+            
+            self.data_changed.emit(self.cell_index, row, col, new_text)
+            
+            if self.auto_resize_columns:
+                self.resizeColumnToContents(col)
+    
+    def editItem(self, item):
+        """重写editItem以记录编辑前的文本"""
+        if item:
+            self._old_text_before_edit = item.text()
+        super().editItem(item)
+
+    
+    
+
     def configure(self, user_id: int, cell_index: int, config: CellConfig, auto_resize: bool = True):
         """配置表格"""
         self.user_id = user_id
@@ -797,18 +1670,48 @@ class DataTableWidget(QTableWidget):
                     header_item = QTableWidgetItem(title)
                     self.setHorizontalHeaderItem(col, header_item)
                     
-    def on_item_changed(self, item: QTableWidgetItem):
-        """数据变化处理"""
-        if item and self.user_id and self.cell_index is not None:
-            row = item.row()
-            col = item.column()
-            content = item.text()
-            self.data_changed.emit(self.cell_index, row, col, content)
+    def set_highlight(self, keyword: str = None):
+        """设置高亮关键词"""
+        self.highlight_keyword = keyword
+        self.update_all_items_highlight()
+        
+    def clear_highlight(self):
+        """清除高亮"""
+        self.highlight_keyword = None
+        self.update_all_items_highlight()
+        
+    def update_all_items_highlight(self):
+        """更新所有单元格的高亮"""
+        for row in range(self.rowCount()):
+            for col in range(self.columnCount()):
+                item = self.item(row, col)
+                if item:
+                    self.apply_highlight_to_item(item)
+                    
+    def apply_highlight_to_item(self, item: QTableWidgetItem):
+        """对单个单元格应用高亮"""
+        text = item.text()
+        if not text:
+            return
             
-            # 如果启用自动调整列宽，请求调整
-            if self.auto_resize_columns:
-                self.resizeColumnToContents(col)
-            
+        if self.highlight_keyword and self.highlight_keyword.lower() in text.lower():
+            # 高亮显示
+            item.setBackground(QColor("#ffeb3b"))  # 黄色背景
+            item.setForeground(QColor("#000000"))  # 黑色文字
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+        else:
+            # 正常显示 - 交替行颜色
+            if item.row() % 2 == 0:
+                item.setBackground(QColor("#ffffff"))
+            else:
+                item.setBackground(QColor("#f5f5f5"))
+            item.setForeground(QColor("#000000"))
+            font = item.font()
+            font.setBold(False)
+            item.setFont(font)
+                    
     def load_data(self, records: List[Dict]):
         """加载数据"""
         self.blockSignals(True)
@@ -825,6 +1728,7 @@ class DataTableWidget(QTableWidget):
                         item = QTableWidgetItem()
                         self.setItem(row, col, item)
                     item.setText(content or "")
+                    self.apply_highlight_to_item(item)
                     
         self.blockSignals(False)
         
@@ -950,6 +1854,8 @@ class UserConfigDialog(QDialog):
         super().__init__(parent)
         self.db_manager = db_manager
         self.user_id = user_id
+        self._existing_cell_configs = {}  # 已有各单元格配置（保留每个单元格独立的标题等）
+        self.cell_title_edits = []        # 各单元格标题输入框
         self.setup_ui()
         
     def setup_ui(self):
@@ -1030,6 +1936,26 @@ class UserConfigDialog(QDialog):
         cell_group.setLayout(cell_layout)
         layout.addWidget(cell_group)
         
+        # 各单元格标题配置（不同单元格可以使用不同标题）
+        cell_titles_group = QGroupBox("各单元格标题")
+        cell_titles_group.setToolTip("为每个单元格设置独立的标题，不同单元格可以使用不同的标题")
+        cell_titles_layout = QVBoxLayout()
+        
+        titles_hint = QLabel("说明：每个单元格可以设置独立的标题（如“登记表”、“考勤表”等），互不影响")
+        titles_hint.setStyleSheet("color: gray; font-size: 10px;")
+        cell_titles_layout.addWidget(titles_hint)
+        
+        self.cell_titles_scroll = QScrollArea()
+        self.cell_titles_scroll.setWidgetResizable(True)
+        self.cell_titles_scroll.setMaximumHeight(200)
+        self.cell_titles_widget = QWidget()
+        self.cell_titles_form = QFormLayout(self.cell_titles_widget)
+        self.cell_titles_scroll.setWidget(self.cell_titles_widget)
+        cell_titles_layout.addWidget(self.cell_titles_scroll)
+        
+        cell_titles_group.setLayout(cell_titles_layout)
+        layout.addWidget(cell_titles_group)
+        
         # 提示信息
         notice_label = QLabel("提示: 行列数设置过大会影响性能，请根据实际需求设置")
         notice_label.setStyleSheet("color: orange; font-size: 10px;")
@@ -1045,6 +1971,10 @@ class UserConfigDialog(QDialog):
         
         # 连接信号
         self.title_mode_combo.currentTextChanged.connect(self.on_title_mode_changed)
+        self.cell_count_spin.valueChanged.connect(self.rebuild_cell_titles)
+        
+        # 初始化各单元格标题输入框
+        self.rebuild_cell_titles()
         
         # 加载现有配置
         if self.user_id:
@@ -1065,12 +1995,36 @@ class UserConfigDialog(QDialog):
             self.require_title_cb.isChecked() and mode == TitleMode.UNIFIED.value
         )
             
+    def rebuild_cell_titles(self):
+        """根据单元格数量重建各单元格标题输入框"""
+        # 先记住已填写的标题，避免重建时丢失
+        current_titles = []
+        for edit in self.cell_title_edits:
+            current_titles.append(edit.text())
+        self.cell_title_edits = []
+        
+        # 清空原有表单行
+        while self.cell_titles_form.rowCount() > 0:
+            self.cell_titles_form.removeRow(0)
+        
+        count = self.cell_count_spin.value()
+        for i in range(count):
+            label = QLabel(f"单元格 {i + 1}:")
+            edit = QLineEdit()
+            edit.setPlaceholderText(f"请输入单元格 {i + 1} 的标题（默认为“单元格 {i + 1}”）")
+            if i < len(current_titles):
+                edit.setText(current_titles[i])
+            self.cell_titles_form.addRow(label, edit)
+            self.cell_title_edits.append(edit)
+            
     def load_config(self):
         """加载现有配置"""
         # 从数据库加载用户配置
         user = self.db_manager.get_user_by_id(self.user_id)
         if user and user.get("config"):
             config = user["config"]
+            # 保留已有的各单元格配置（避免编辑时丢失每个单元格独立的标题等配置）
+            self._existing_cell_configs = config.get("cell_configs", {}) or {}
             self.cell_count_spin.setValue(config.get("cell_count", 6))
             self.auto_resize_cb.setChecked(config.get("auto_resize_columns", True))
             default_cell = config.get("default_cell", {})
@@ -1090,24 +2044,60 @@ class UserConfigDialog(QDialog):
                 
             self.title_text_edit.setText(default_cell.get("title_text", ""))
             
+            # 填充各单元格标题（有独立配置的取原标题，否则使用默认的“单元格 N”)
+            self.rebuild_cell_titles()
+            for i, edit in enumerate(self.cell_title_edits):
+                key = str(i)
+                existing_cfg = self._existing_cell_configs.get(key, {})
+                edit.setText(existing_cfg.get("title_text") or f"单元格 {i + 1}")
+            
     def get_config(self) -> Dict:
         """获取配置"""
+        # 默认单元格配置
+        default_cell = {
+            "row_count": self.cell_rows_spin.value(),
+            "col_count": self.cell_cols_spin.value(),
+            "require_login_time": self.require_login_time_cb.isChecked(),
+            "calculate_days_diff": self.calculate_days_cb.isChecked(),
+            "require_title": self.require_title_cb.isChecked(),
+            "title_mode": self.title_mode_combo.currentData(),
+            "title_text": self.title_text_edit.text(),
+            "column_titles": {},
+            "title_unique": self.title_mode_combo.currentData() == TitleMode.UNIFIED.value,
+            "scheme_type": CellScheme.STANDARD.value
+        }
+        
+        # 构建各单元格配置：保留已有的独立配置，并应用各单元格标题
+        cell_configs = {}
+        for i in range(self.cell_count_spin.value()):
+            key = str(i)
+            existing = dict(self._existing_cell_configs.get(key, {}) or {})
+            new_title = ""
+            if i < len(self.cell_title_edits):
+                new_title = self.cell_title_edits[i].text().strip()
+            
+            if existing:
+                # 已有独立配置：保留原有配置，仅更新标题
+                cell_cfg = dict(default_cell)
+                cell_cfg.update(existing)
+                cell_cfg["title_text"] = new_title
+                # 未设置独立列标题时，使用统一标题模式以显示标题
+                if not cell_cfg.get("column_titles"):
+                    cell_cfg["title_mode"] = TitleMode.UNIFIED.value
+                cell_configs[key] = cell_cfg
+            elif new_title:
+                # 无独立配置但设置了标题：基于默认配置创建
+                cell_cfg = dict(default_cell)
+                cell_cfg["title_text"] = new_title
+                cell_cfg["title_mode"] = TitleMode.UNIFIED.value
+                cell_configs[key] = cell_cfg
+            # 否则不创建独立配置，加载时使用默认标题（单元格 N）
+        
         return {
             "cell_count": self.cell_count_spin.value(),
             "auto_resize_columns": self.auto_resize_cb.isChecked(),
-            "default_cell": {
-                "row_count": self.cell_rows_spin.value(),
-                "col_count": self.cell_cols_spin.value(),
-                "require_login_time": self.require_login_time_cb.isChecked(),
-                "calculate_days_diff": self.calculate_days_cb.isChecked(),
-                "require_title": self.require_title_cb.isChecked(),
-                "title_mode": self.title_mode_combo.currentData(),
-                "title_text": self.title_text_edit.text(),
-                "column_titles": {},
-                "title_unique": self.title_mode_combo.currentData() == TitleMode.UNIFIED.value,
-                "scheme_type": CellScheme.STANDARD.value
-            },
-            "cell_configs": {}
+            "default_cell": default_cell,
+            "cell_configs": cell_configs
         }
 
 
@@ -1242,13 +2232,13 @@ class LoginDialog(QDialog):
     def __init__(self, db_manager: DatabaseManager, parent=None):
         super().__init__(parent)
         self.db_manager = db_manager
-        self.settings = QSettings(APP_NAME, APP_NAME)
+        self.settings = AppSettings()
         self.setup_ui()
         self.load_last_user()
         
     def setup_ui(self):
         """设置UI"""
-        self.setWindowTitle("用户登录")
+        self.setWindowTitle(f"用户登录 - {ProjectInfo.get_full_name()}")
         self.setFixedSize(450, 380)
         
         # 设置窗口图标
@@ -1257,7 +2247,7 @@ class LoginDialog(QDialog):
         layout = QVBoxLayout()
         
         # 标题
-        title_label = QLabel(APP_NAME)
+        title_label = QLabel(ProjectInfo.get_full_name())
         title_label.setAlignment(Qt.AlignCenter)
         title_font = QFont()
         title_font.setPointSize(18)
@@ -1783,25 +2773,39 @@ class BackupRestoreDialog(QDialog):
         self.refresh_backup_list()
         
     def refresh_backup_list(self):
-        """刷新备份列表"""
+        """刷新备份列表（后台线程）"""
         self.backup_tree.clear()
-        backups = self.backup_manager.get_backup_list()
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
         
-        # 应用筛选
+        self._refresh_worker = BackgroundWorker(self)
+        self._refresh_worker.setup(self._do_refresh_backup_list)
+        self._refresh_worker.finished.connect(self._on_refresh_list_finished)
+        self._refresh_worker.error.connect(self._on_bg_error)
+        self._refresh_worker.start()
+    
+    def _do_refresh_backup_list(self):
+        """在后台线程中获取备份列表并筛选"""
+        backups = self.backup_manager.get_backup_list()
         backup_type = self.type_combo.currentText()
         start_datetime = self.start_date.dateTime()
         end_datetime = self.end_date.dateTime()
         
+        filtered = []
         for backup in backups:
-            # 类型筛选
             if backup_type != "全部" and backup["type"] != backup_type:
                 continue
-                
-            # 时间筛选
             if backup["datetime"]:
                 if backup["datetime"] < start_datetime or backup["datetime"] > end_datetime:
                     continue
+            filtered.append(backup)
+        return filtered
+    
+    def _on_refresh_list_finished(self, backups):
+        """备份列表加载完成（主线程回调）"""
+        self.progress_bar.setVisible(False)
                     
+        for backup in backups:
             # 显示类型
             type_display = {
                 "manual": "手动备份",
@@ -1864,7 +2868,7 @@ class BackupRestoreDialog(QDialog):
         self.restore_backup(backup_path)
         
     def restore_backup(self, backup_path: str):
-        """执行备份恢复"""
+        """执行备份恢复（后台线程）"""
         reply = QMessageBox.question(
             self, "确认恢复", 
             "恢复操作将替换当前数据库，并创建回滚备份。\n确定要继续吗？",
@@ -1874,32 +2878,62 @@ class BackupRestoreDialog(QDialog):
         if reply == QMessageBox.Yes:
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)  # 不确定进度
+            self.restore_btn.setEnabled(False)
+            self.backup_btn.setEnabled(False)
             
-            success, result = self.backup_manager.restore_backup(backup_path)
-            
-            self.progress_bar.setVisible(False)
-            
-            if success:
-                QMessageBox.information(self, "成功", f"数据库恢复成功！\n回滚备份已创建: {result}")
-                self.backup_restored.emit()
-                self.refresh_backup_list()
-            else:
-                QMessageBox.critical(self, "错误", f"数据库恢复失败: {result}")
-                
-    def on_manual_backup(self):
-        """手动备份"""
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        
-        success, result, info = self.backup_manager.create_backup("manual")
-        
+            self._restore_worker = BackgroundWorker(self)
+            self._restore_worker.setup(self.backup_manager.restore_backup, backup_path)
+            self._restore_worker.finished.connect(self._on_restore_finished)
+            self._restore_worker.error.connect(self._on_bg_error)
+            self._restore_worker.start()
+    
+    def _on_restore_finished(self, result):
+        """恢复完成（主线程回调）"""
         self.progress_bar.setVisible(False)
+        self.restore_btn.setEnabled(True)
+        self.backup_btn.setEnabled(True)
         
+        success, msg = result
         if success:
-            QMessageBox.information(self, "成功", f"手动备份成功: {result}")
+            QMessageBox.information(self, "成功", f"数据库恢复成功！\n回滚备份已创建: {msg}")
+            self.backup_restored.emit()
             self.refresh_backup_list()
         else:
-            QMessageBox.critical(self, "错误", f"备份失败: {result}")
+            QMessageBox.critical(self, "错误", f"数据库恢复失败: {msg}")
+                
+    def on_manual_backup(self):
+        """手动备份（后台线程）"""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.backup_btn.setEnabled(False)
+        self.restore_btn.setEnabled(False)
+        
+        self._backup_worker = BackgroundWorker(self)
+        self._backup_worker.setup(self.backup_manager.create_backup, "manual")
+        self._backup_worker.finished.connect(self._on_manual_backup_finished)
+        self._backup_worker.error.connect(self._on_bg_error)
+        self._backup_worker.start()
+    
+    def _on_manual_backup_finished(self, result):
+        """手动备份完成（主线程回调）"""
+        self.progress_bar.setVisible(False)
+        self.backup_btn.setEnabled(True)
+        self.restore_btn.setEnabled(True)
+        
+        success, backup_name, info = result
+        if success:
+            QMessageBox.information(self, "成功", f"手动备份成功: {backup_name}")
+            self.refresh_backup_list()
+        else:
+            QMessageBox.critical(self, "错误", f"备份失败: {backup_name}")
+    
+    def _on_bg_error(self, error_msg: str):
+        """后台任务出错处理"""
+        self.progress_bar.setVisible(False)
+        self.restore_btn.setEnabled(True)
+        self.backup_btn.setEnabled(True)
+        print(f"[备份/恢复错误] {error_msg}")
+        QMessageBox.critical(self, "错误", f"操作失败:\n{error_msg.split(chr(10))[0]}")
 
 
 class DataEntryWindow(QMainWindow):
@@ -1914,18 +2948,24 @@ class DataEntryWindow(QMainWindow):
         self.current_user_config = user_data.get("config", {})
         self.debug_mode = False
         self.login_time = datetime.now()
+        self.search_results = []  # 存储搜索结果
+        self._tables_ready = False  # 标记表格是否已创建
         self.init_settings()
         self.setup_ui()
+        # 恢复上次的窗口位置和大小
+        self._restore_window_geometry()
+        # 窗口先显示，延迟加载配置和数据（避免启动卡顿）
+        QTimer.singleShot(30, self._startup_load)
         
     def init_settings(self):
         """初始化设置"""
-        self.settings = QSettings(APP_NAME, APP_NAME)
-        self.debug_mode = self.settings.value("debug_mode", False, type=bool)
+        self.settings = AppSettings()
+        self.debug_mode = self.settings.get("debug_mode", False)
         
     def setup_ui(self):
         """设置UI"""
-        self.setWindowTitle(f"{APP_NAME} - 当前用户: {self.user_data['username']}")
-        self.resize(1200, 800)
+        self.setWindowTitle(ProjectInfo.get_full_title(self.user_data['username']))
+        self.resize(1400, 800)  # 增加宽度以容纳搜索面板
         
         # 设置窗口图标
         self.setWindowIcon(get_app_icon())
@@ -1936,10 +2976,13 @@ class DataEntryWindow(QMainWindow):
         # 创建工具栏
         self.create_tool_bar()
         
-        # 中央部件
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout()
+        # 创建主分割器
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        
+        # 左侧内容区域
+        left_widget = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(0, 0, 0, 0)
         
         # 用户信息栏
         info_layout = QHBoxLayout()
@@ -1963,12 +3006,31 @@ class DataEntryWindow(QMainWindow):
         info_layout.addWidget(QLabel("选择单元格:"))
         info_layout.addWidget(self.cell_selector)
         
-        main_layout.addLayout(info_layout)
+        left_layout.addLayout(info_layout)
         
         # 表格区域
         self.table_tabs = QTabWidget()
         self.table_tabs.setTabsClosable(False)
-        main_layout.addWidget(self.table_tabs)
+        left_layout.addWidget(self.table_tabs)
+        
+        left_widget.setLayout(left_layout)
+        self.main_splitter.addWidget(left_widget)
+        
+        # 右侧搜索面板
+        self.search_panel = SearchResultPanel()
+        self.search_panel.setVisible(False)
+        self.search_panel.setMinimumWidth(350)
+        self.search_panel.setMaximumWidth(500)
+        self.search_panel.close_btn.clicked.connect(self.hide_search_panel)
+        self.search_panel.result_selected.connect(self.on_search_result_selected)
+        self.main_splitter.addWidget(self.search_panel)
+        
+        # 设置分割比例
+        self.main_splitter.setSizes([1050, 350])
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 1)
+        
+        self.setCentralWidget(self.main_splitter)
         
         # 状态栏
         self.status_bar = QStatusBar()
@@ -1983,16 +3045,10 @@ class DataEntryWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         self.status_bar.addWidget(self.status_label)
         
-        central_widget.setLayout(main_layout)
-        
         # 启动自动备份定时器
         self.auto_backup_timer = QTimer()
         self.auto_backup_timer.timeout.connect(self.auto_backup)
         self.auto_backup_timer.start(3600000)  # 每小时备份一次
-        
-        # 加载用户配置和数据
-        self.load_user_config()
-        self.load_user_data()
         
     def create_menu_bar(self):
         """创建菜单栏"""
@@ -2056,6 +3112,7 @@ class DataEntryWindow(QMainWindow):
     def create_tool_bar(self):
         """创建工具栏"""
         toolbar = QToolBar()
+        toolbar.setObjectName("mainToolBar")
         self.addToolBar(toolbar)
         
         # 备份按钮
@@ -2077,31 +3134,50 @@ class DataEntryWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addWidget(QLabel("搜索:"))
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("支持中文、英文...")
-        self.search_edit.textChanged.connect(self.on_search)
+        self.search_edit.setPlaceholderText("支持中文、英文...（按回车搜索）")
+        self.search_edit.setMinimumWidth(200)
+        self.search_edit.returnPressed.connect(self.on_search_pressed)
         toolbar.addWidget(self.search_edit)
         
+        # 搜索按钮
+        self.search_btn = QPushButton("搜索")
+        self.search_btn.clicked.connect(self.on_search_pressed)
+        toolbar.addWidget(self.search_btn)
+        
+        # 清除搜索按钮
+        self.clear_search_btn = QPushButton("清除")
+        self.clear_search_btn.clicked.connect(self.clear_search)
+        self.clear_search_btn.setEnabled(False)
+        toolbar.addWidget(self.clear_search_btn)
+        
     def load_user_config(self):
-        """加载用户配置"""
-        # 从数据库获取最新配置
+        """加载用户配置（DB查询在后台，UI创建在主线程）"""
+        self._config_worker = BackgroundWorker(self)
+        self._config_worker.setup(self._do_load_user_config)
+        self._config_worker.finished.connect(self._on_config_loaded)
+        self._config_worker.error.connect(self._on_worker_error)
+        self._config_worker.start()
+    
+    def _do_load_user_config(self):
+        """在后台线程中查询用户配置"""
         user = self.db_manager.get_user_by_id(self.user_data["id"])
-        if user:
-            self.current_user_config = user.get("config", {})
-            
-        # 如果没有配置，创建默认配置
-        if not self.current_user_config:
-            self.current_user_config = {
+        config = user.get("config", {}) if user else {}
+        if not config:
+            config = {
                 "cell_count": 6,
                 "auto_resize_columns": True,
                 "cell_configs": {}
             }
-            
-        # 获取自动调整列宽设置
-        auto_resize = self.current_user_config.get("auto_resize_columns", True)
-            
+        return config
+    
+    def _on_config_loaded(self, config):
+        """配置加载完成，在主线程创建表格UI"""
+        self.current_user_config = config
+        auto_resize = config.get("auto_resize_columns", True)
+        
         # 初始化单元格选择器
         self.cell_selector.clear()
-        total_cells = self.current_user_config.get("cell_count", 6)
+        total_cells = config.get("cell_count", 6)
         for i in range(total_cells):
             self.cell_selector.addItem(f"单元格 {i+1}")
             
@@ -2111,14 +3187,13 @@ class DataEntryWindow(QMainWindow):
             tab = DataTableWidget()
             
             # 获取或创建单元格配置
-            cell_config = None
-            cell_configs = self.current_user_config.get("cell_configs", {})
+            cell_configs = config.get("cell_configs", {})
             if str(i) in cell_configs:
                 cell_config_dict = cell_configs[str(i)]
                 cell_config = CellConfig(**cell_config_dict)
             else:
                 # 使用默认配置
-                default_cell = self.current_user_config.get("default_cell", {})
+                default_cell = config.get("default_cell", {})
                 cell_config = CellConfig(
                     row_count=default_cell.get("row_count", 3),
                     col_count=default_cell.get("col_count", 4),
@@ -2126,7 +3201,7 @@ class DataEntryWindow(QMainWindow):
                     calculate_days_diff=default_cell.get("calculate_days_diff", True),
                     require_title=default_cell.get("require_title", True),
                     title_mode=default_cell.get("title_mode", TitleMode.UNIFIED.value),
-                    title_text=default_cell.get("title_text", f"单元格 {i+1}"),
+                    title_text=default_cell.get("title_text") or f"单元格 {i+1}",
                     column_titles=default_cell.get("column_titles", {}),
                     title_unique=default_cell.get("title_unique", True),
                     scheme_type=default_cell.get("scheme_type", CellScheme.STANDARD.value)
@@ -2134,19 +3209,49 @@ class DataEntryWindow(QMainWindow):
                 
             tab.configure(self.user_data["id"], i, cell_config, auto_resize)
             tab.data_changed.connect(self.on_data_changed)
+            tab.paste_extended.connect(self.on_table_extended)
             self.table_tabs.addTab(tab, f"单元格 {i+1}")
+        
+        self._tables_ready = True
+        # 表格创建完成后，加载数据
+        self.load_user_data()
+    
+    def _startup_load(self):
+        """启动时加载配置和数据（窗口已显示后再执行）"""
+        self.status_label.setText("正在加载配置...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.load_user_config()  # DB查询后台 → 表格创建主线程 → 自动触发 load_user_data
             
     def load_user_data(self):
-        """加载用户数据"""
+        """加载用户数据（后台线程）"""
         if not self.user_data:
             return
-            
-        records = self.db_manager.get_data_records(self.user_data["id"])
+        
+        self.status_label.setText("正在加载数据...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # 不确定进度
+        
+        self._data_worker = BackgroundWorker(self)
+        self._data_worker.setup(self._do_load_data)
+        self._data_worker.finished.connect(self._on_data_loaded)
+        self._data_worker.error.connect(self._on_worker_error)
+        self._data_worker.start()
+    
+    def _do_load_data(self):
+        """在后台线程中加载数据"""
+        return self.db_manager.get_data_records(self.user_data["id"])
+    
+    def _on_data_loaded(self, records):
+        """数据加载完成（主线程回调）"""
+        self.progress_bar.setVisible(False)
         
         # 分发数据到各个表格
         for i in range(self.table_tabs.count()):
             tab = self.table_tabs.widget(i)
             tab.load_data(records)
+        
+        self.status_label.setText(f"数据加载完成，共 {len(records)} 条记录")
             
     def on_data_changed(self, cell_index: int, row: int, col: int, content: str):
         """数据变化处理"""
@@ -2164,39 +3269,143 @@ class DataEntryWindow(QMainWindow):
         if index >= 0:
             self.table_tabs.setCurrentIndex(index)
             
-    def on_search(self, keyword: str):
-        """搜索处理"""
-        if not keyword or not self.user_data:
+    def on_search_pressed(self):
+        """按回车或点击按钮触发搜索"""
+        keyword = self.search_edit.text().strip()
+        if keyword:
+            self.perform_search(keyword)
+        else:
+            self.status_label.setText("请输入搜索关键词")
+            
+    def clear_search(self):
+        """清除搜索"""
+        self.search_edit.clear()
+        self.clear_highlight_all_tables()
+        self.hide_search_panel()
+        self.clear_search_btn.setEnabled(False)
+        self.status_label.setText("已清除搜索结果")
+        self.search_results = []
+        
+    def hide_search_panel(self):
+        """隐藏搜索面板"""
+        self.search_panel.setVisible(False)
+        # 调整分割器，让左侧占据大部分空间
+        total_width = self.main_splitter.width()
+        self.main_splitter.setSizes([total_width - 50, 50])
+        
+    def clear_highlight_all_tables(self):
+        """清除所有表格的高亮"""
+        for i in range(self.table_tabs.count()):
+            tab = self.table_tabs.widget(i)
+            if hasattr(tab, 'clear_highlight'):
+                tab.clear_highlight()
+                
+    def on_search_result_selected(self, cell_index: int, row: int, col: int):
+        """选择搜索结果"""
+        # 切换到对应的单元格
+        if cell_index < self.cell_selector.count():
+            self.cell_selector.setCurrentIndex(cell_index)
+            self.table_tabs.setCurrentIndex(cell_index)
+            
+            # 选中对应的单元格
+            tab = self.table_tabs.widget(cell_index)
+            if tab:
+                tab.setCurrentCell(row, col)
+                # 滚动到该单元格
+                item = tab.item(row, col)
+                if item:
+                    tab.scrollToItem(item, QTableWidget.PositionAtCenter)
+                tab.setFocus()
+                # 添加一个短暂的闪烁效果来突出显示选中的单元格
+                tab.editItem(item)
+            
+    def perform_search(self, keyword: str):
+        """执行搜索（后台线程）"""
+        if not self.user_data:
             return
             
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-            
-        results = self.db_manager.search_data(self.user_data["id"], keyword)
+        self.status_label.setText(f"正在搜索: {keyword}...")
         
+        # 清除旧的高亮
+        self.clear_highlight_all_tables()
+        
+        # 取消之前的搜索任务
+        if hasattr(self, '_search_worker') and self._search_worker.isRunning():
+            self._search_worker.cancel()
+        
+        self._search_worker = BackgroundWorker(self)
+        self._search_worker.setup(self.db_manager.search_data, self.user_data["id"], keyword)
+        self._search_worker.finished.connect(lambda results: self._on_search_finished(results, keyword))
+        self._search_worker.error.connect(self._on_worker_error)
+        self._search_worker.start()
+    
+    def _on_search_finished(self, results, keyword):
+        """搜索完成（主线程回调）"""
+        self.search_results = results
         self.progress_bar.setVisible(False)
         
         if results:
-            result_text = f"找到 {len(results)} 条记录:\n\n"
-            for r in results:
-                result_text += f"单元格 {r['cell_index']+1}, 位置({r['row_index']+1},{r['col_index']+1}): {r['content']}\n"
-            QMessageBox.information(self, "搜索结果", result_text)
-            self.status_label.setText(f"搜索完成，找到 {len(results)} 条记录")
-        else:
-            QMessageBox.information(self, "搜索结果", "未找到匹配的记录")
-            self.status_label.setText("未找到匹配的记录")
+            # 对所有表格应用高亮
+            for i in range(self.table_tabs.count()):
+                tab = self.table_tabs.widget(i)
+                if hasattr(tab, 'set_highlight'):
+                    tab.set_highlight(keyword)
             
+            # 显示搜索面板
+            self.search_panel.set_results(results, keyword)
+            self.search_panel.setVisible(True)
+            
+            # 调整分割器
+            total_width = self.main_splitter.width()
+            panel_width = min(400, total_width // 3)
+            self.main_splitter.setSizes([total_width - panel_width, panel_width])
+            
+            self.clear_search_btn.setEnabled(True)
+            self.status_label.setText(f"搜索完成，找到 {len(results)} 条记录")
+            
+            # 自动跳转到第一个结果
+            if results:
+                first = results[0]
+                self.on_search_result_selected(
+                    first['cell_index'],
+                    first['row_index'],
+                    first['col_index']
+                )
+        else:
+            self.hide_search_panel()
+            QMessageBox.information(self, "搜索结果", f"未找到包含 \"{keyword}\" 的记录")
+            self.status_label.setText(f"未找到包含 \"{keyword}\" 的记录")
+            self.clear_search_btn.setEnabled(True)
+     
     def refresh_data(self):
         """刷新数据"""
         self.load_user_data()
-        self.status_label.setText("数据已刷新")
         
     def auto_backup(self):
-        """自动备份"""
+        """自动备份（后台线程）"""
         if self.backup_manager:
-            success, result, info = self.backup_manager.create_backup("auto")
-            if success and self.debug_mode:
-                self.status_label.setText(f"自动备份完成: {result}")
+            if hasattr(self, '_backup_worker') and self._backup_worker.isRunning():
+                return  # 上一次备份还在进行中，跳过
+            
+            self._backup_worker = BackgroundWorker(self)
+            self._backup_worker.setup(self.backup_manager.create_backup, "auto")
+            self._backup_worker.finished.connect(self._on_auto_backup_finished)
+            self._backup_worker.error.connect(self._on_worker_error)
+            self._backup_worker.start()
+    
+    def _on_auto_backup_finished(self, result):
+        """自动备份完成（主线程回调）"""
+        success, backup_name, info = result
+        if success and self.debug_mode:
+            self.status_label.setText(f"自动备份完成: {backup_name}")
+    
+    def _on_worker_error(self, error_msg: str):
+        """后台任务出错处理"""
+        self.progress_bar.setVisible(False)
+        print(f"[后台任务错误] {error_msg}")
+        self.status_label.setText("后台任务执行出错，请查看日志")
                 
     def show_backup_dialog(self):
         """显示备份恢复对话框"""
@@ -2229,9 +3438,9 @@ class DataEntryWindow(QMainWindow):
         if dialog.exec():
             config = dialog.get_config()
             if self.db_manager.update_user_config(self.user_data["id"], config):
-                self.load_user_config()
-                self.load_user_data()
-                QMessageBox.information(self, "成功", "配置已更新")
+                self.current_user_config = config  # 先更新内存中的配置
+                self.load_user_config()  # 异步重新加载（完成后自动触发 load_user_data）
+                QMessageBox.information(self, "成功", "配置已更新，正在重新加载...")
             else:
                 QMessageBox.warning(self, "错误", "保存配置失败")
                 
@@ -2324,32 +3533,96 @@ class DataEntryWindow(QMainWindow):
             
     def show_about(self):
         """显示关于对话框"""
-        QMessageBox.about(
-            self, "关于",
-            f"{APP_NAME} v{APP_VERSION}\n\n"
-            "资料登记管理系统\n"
-            "功能特性:\n"
-            "- 多用户管理\n"
-            "- 支持空密码登录\n"
-            "- 用户下拉选择，记住上次登录\n"
-            "- 灵活的表格配置（每个单元格的行列数可自定义）\n"
-            "- 灵活的单元格数量设置\n"
-            "- 支持统一标题和独立标题两种模式\n"
-            "- 自动调整列宽（根据内容）\n"
-            "- 数据库自动备份\n"
-            "- 数据搜索功能\n"
-            "- 支持WAL模式\n\n"
-            "默认管理员账号: admin\n"
-            "默认管理员密码: admin123\n\n"
-            "© 2024 版权所有"
-        )
+        about_html = ProjectInfo.get_about_text()
+        about_html += """
+        <h3>功能特性:</h3>
+        <ul>
+            <li>多用户管理</li>
+            <li>支持空密码登录</li>
+            <li>用户下拉选择，记住上次登录</li>
+            <li>灵活的表格配置（每个单元格的行列数可自定义）</li>
+            <li>灵活的单元格数量设置</li>
+            <li>支持统一标题和独立标题两种模式</li>
+            <li>自动调整列宽（根据内容）</li>
+            <li>数据库自动备份</li>
+            <li>数据搜索功能（支持高亮显示）</li>
+            <li>支持多选复制、剪切、粘贴（Excel风格）</li>
+            <li>支持撤销/重做操作（Ctrl+Z/Ctrl+Y）</li>
+            <li>支持WAL模式</li>
+            <li>多线程后台处理（数据加载/搜索/备份不阻塞界面）</li>
+        </ul>
+        <h3>默认管理员:</h3>
+        <p>账号: admin<br>密码: admin123</p>
+        """
+        
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("关于")
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setTextFormat(Qt.RichText)
+        msg_box.setText(about_html)
+        msg_box.exec()
+
+    def on_table_extended(self, cell_index: int, new_rows: int, new_cols: int):
+        """表格被扩展时更新配置"""
+        if cell_index >= 0:
+            cell_configs = self.current_user_config.get("cell_configs", {})
+            if str(cell_index) in cell_configs:
+                cell_configs[str(cell_index)]["row_count"] = new_rows
+                cell_configs[str(cell_index)]["col_count"] = new_cols
+            else:
+                # 更新默认配置
+                default_cell = self.current_user_config.get("default_cell", {})
+                default_cell["row_count"] = new_rows
+                default_cell["col_count"] = new_cols
+                self.current_user_config["default_cell"] = default_cell
+            
+            self.current_user_config["cell_configs"] = cell_configs
+            # 自动保存配置
+            self.db_manager.update_user_config(self.user_data["id"], self.current_user_config)
+
+
+
         
     def closeEvent(self, event):
         """关闭事件"""
+        # 保存窗口位置和大小
+        self._save_window_geometry()
         # 停止自动备份定时器
         if hasattr(self, 'auto_backup_timer'):
             self.auto_backup_timer.stop()
+        # 取消所有运行中的后台任务
+        for worker_attr in ['_data_worker', '_search_worker', '_backup_worker']:
+            if hasattr(self, worker_attr):
+                worker = getattr(self, worker_attr)
+                if worker.isRunning():
+                    worker.cancel()
         event.accept()
+
+    def _save_window_geometry(self):
+        """保存窗口位置和大小到设置文件"""
+        try:
+            geometry = self.saveGeometry()
+            state = self.saveState()
+            self.settings.set("window_geometry", geometry.toHex().data().decode())
+            self.settings.set("window_state", state.toHex().data().decode())
+        except Exception as e:
+            print(f"[窗口] 保存窗口位置失败: {e}")
+
+    def _restore_window_geometry(self):
+        """从设置文件恢复窗口位置和大小"""
+        try:
+            geometry_hex = self.settings.get("window_geometry")
+            state_hex = self.settings.get("window_state")
+            if geometry_hex:
+                from PySide6.QtCore import QByteArray
+                self.restoreGeometry(QByteArray.fromHex(geometry_hex.encode()))
+            if state_hex:
+                from PySide6.QtCore import QByteArray
+                self.restoreState(QByteArray.fromHex(state_hex.encode()))
+        except Exception as e:
+            print(f"[窗口] 恢复窗口位置失败: {e}")
+
+
 
 
 def get_app_icon() -> QIcon:
@@ -2398,25 +3671,315 @@ class MainApplication(QApplication):
         return True
 
 
+
+class SearchResultPanel(QWidget):
+    """搜索结果面板 - 使用 QTextDocument + QTextCursor 方案"""
+    
+    result_selected = Signal(int, int, int)  # cell_index, row, col
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+        self.results = []
+        self.keyword = ""
+        self.current_index = -1
+        self.result_positions = []  # 存储每个结果在文档中的位置，用于导航
+        
+    def setup_ui(self):
+        """设置UI"""
+        layout = QVBoxLayout()
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        
+        # 标题栏
+        title_layout = QHBoxLayout()
+        self.title_label = QLabel("🔍 搜索结果")
+        title_font = QFont()
+        title_font.setBold(True)
+        title_font.setPointSize(12)
+        self.title_label.setFont(title_font)
+        title_layout.addWidget(self.title_label)
+        
+        title_layout.addStretch()
+        
+        self.close_btn = QPushButton("×")
+        self.close_btn.setFixedSize(28, 28)
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.setStyleSheet("""
+            QPushButton {
+                border: none;
+                border-radius: 14px;
+                background-color: #f0f0f0;
+                font-size: 18px;
+                font-weight: bold;
+                color: #666;
+            }
+            QPushButton:hover {
+                background-color: #ff4444;
+                color: white;
+            }
+        """)
+        self.close_btn.setToolTip("关闭搜索面板")
+        title_layout.addWidget(self.close_btn)
+        
+        layout.addLayout(title_layout)
+        
+        # 分隔线
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        line.setStyleSheet("background-color: #ddd;")
+        layout.addWidget(line)
+        
+        # 结果统计
+        self.stats_label = QLabel()
+        self.stats_label.setStyleSheet("""
+            color: #666; 
+            padding: 5px; 
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        """)
+        layout.addWidget(self.stats_label)
+        
+        # 使用 QTextEdit 显示搜索结果（支持富文本）
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setStyleSheet("""
+            QTextEdit {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+                font-family: 'Microsoft YaHei', sans-serif;
+                font-size: 10pt;
+                line-height: 1.5;
+            }
+        """)
+        self.result_text.setCursorWidth(0)  # 隐藏光标
+        layout.addWidget(self.result_text, 1)
+        
+        # 导航按钮
+        nav_layout = QHBoxLayout()
+        nav_layout.setSpacing(10)
+        
+        self.prev_btn = QPushButton("◀ 上一个")
+        self.prev_btn.clicked.connect(self.go_to_previous)
+        self.prev_btn.setEnabled(False)
+        self.prev_btn.setCursor(Qt.PointingHandCursor)
+        self.prev_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 16px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: #f8f9fa;
+            }
+            QPushButton:hover {
+                background-color: #e9ecef;
+            }
+            QPushButton:disabled {
+                color: #ccc;
+                border-color: #eee;
+            }
+        """)
+        nav_layout.addWidget(self.prev_btn)
+        
+        self.next_btn = QPushButton("下一个 ▶")
+        self.next_btn.clicked.connect(self.go_to_next)
+        self.next_btn.setEnabled(False)
+        self.next_btn.setCursor(Qt.PointingHandCursor)
+        self.next_btn.setStyleSheet("""
+            QPushButton {
+                padding: 8px 16px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: #f8f9fa;
+            }
+            QPushButton:hover {
+                background-color: #e9ecef;
+            }
+            QPushButton:disabled {
+                color: #ccc;
+                border-color: #eee;
+            }
+        """)
+        nav_layout.addWidget(self.next_btn)
+        
+        nav_layout.addStretch()
+        
+        # 当前位置指示
+        self.position_label = QLabel("")
+        self.position_label.setStyleSheet("color: #666; font-size: 11px;")
+        nav_layout.addWidget(self.position_label)
+        
+        layout.addLayout(nav_layout)
+        
+        self.setLayout(layout)
+        
+    def set_results(self, results: List[Dict], keyword: str):
+        """设置搜索结果 - 使用 QTextDocument 构建富文本"""
+        self.results = results
+        self.keyword = keyword
+        self.current_index = -1
+        self.result_positions = []
+        
+        if not results:
+            self.title_label.setText("🔍 搜索结果 (0)")
+            self.stats_label.setText("❌ 未找到匹配的记录")
+            self.result_text.clear()
+            self.prev_btn.setEnabled(False)
+            self.next_btn.setEnabled(False)
+            self.position_label.setText("")
+            return
+            
+        self.title_label.setText(f"🔍 搜索结果 ({len(results)})")
+        self.stats_label.setText(f"✅ 找到 {len(results)} 条匹配记录，关键词: \"{keyword}\"")
+        
+        # 创建 QTextDocument
+        doc = QTextDocument()
+        cursor = QTextCursor(doc)
+        
+        # 定义格式
+        # 位置标签格式
+        location_format = QTextCharFormat()
+        location_format.setForeground(QColor("#1976d2"))
+        location_font = QFont("Microsoft YaHei", 10)
+        location_font.setBold(True)
+        location_format.setFont(location_font)
+        
+        # 分隔线格式
+        separator_format = QTextCharFormat()
+        separator_format.setForeground(QColor("#cccccc"))
+        
+        # 内容格式（普通文本）
+        normal_format = QTextCharFormat()
+        normal_format.setForeground(QColor("#333333"))
+        normal_font = QFont("Microsoft YaHei", 9)
+        normal_format.setFont(normal_font)
+        
+        # 高亮格式
+        highlight_format = QTextCharFormat()
+        highlight_format.setBackground(QBrush(QColor("#ffeb3b")))
+        highlight_format.setForeground(QColor("#000000"))
+        highlight_font = QFont("Microsoft YaHei", 9)
+        highlight_font.setBold(True)
+        highlight_format.setFont(highlight_font)
+        
+        # 块格式（用于控制段落间距）
+        block_format = QTextBlockFormat()
+        block_format.setBottomMargin(5)
+        
+        keyword_lower = keyword.lower()
+        
+        for i, result in enumerate(results):
+            # 记录当前光标位置（用于导航）
+            self.result_positions.append(cursor.position())
+            
+            cell_idx = result['cell_index'] + 1
+            row = result['row_index'] + 1
+            col = result['col_index'] + 1
+            content = result['content'] or ""
+            
+            # 添加位置标签
+            cursor.insertText(f"📌 单元格 {cell_idx} - 第 {row} 行, 第 {col} 列\n", location_format)
+            
+            # 添加内容（带高亮）
+            if keyword_lower in content.lower():
+                self.insert_highlighted_text(cursor, content, keyword, 
+                                             normal_format, highlight_format)
+            else:
+                cursor.insertText(content, normal_format)
+            
+            cursor.insertBlock()
+            
+            # 添加分隔线（最后一项不加）
+            if i < len(results) - 1:
+                cursor.insertText("─" * 50 + "\n\n", separator_format)
+        
+        # 记录最后一个结果的结束位置
+        self.result_positions.append(cursor.position())
+        
+        # 设置文档
+        self.result_text.setDocument(doc)
+        
+        self.prev_btn.setEnabled(True)
+        self.next_btn.setEnabled(True)
+        self.update_position_label()
+        
+        # 默认选中第一个结果
+        if results:
+            self.navigate_to_result(0)
+        
+    def insert_highlighted_text(self, cursor: QTextCursor, text: str, keyword: str,
+                                 normal_format: QTextCharFormat, 
+                                 highlight_format: QTextCharFormat):
+        """插入带高亮的文本"""
+        keyword_lower = keyword.lower()
+        text_lower = text.lower()
+        
+        pos = 0
+        while pos < len(text):
+            # 查找关键词位置
+            found_pos = text_lower.find(keyword_lower, pos)
+            
+            if found_pos == -1:
+                # 没有更多关键词，插入剩余文本
+                cursor.insertText(text[pos:], normal_format)
+                break
+            
+            # 插入关键词前的普通文本
+            if found_pos > pos:
+                cursor.insertText(text[pos:found_pos], normal_format)
+            
+            # 插入高亮的关键词（保持原始大小写）
+            keyword_original = text[found_pos:found_pos + len(keyword)]
+            cursor.insertText(keyword_original, highlight_format)
+            
+            pos = found_pos + len(keyword)
+    
+    def navigate_to_result(self, index: int):
+        """导航到指定结果"""
+        if 0 <= index < len(self.results):
+            result = self.results[index]
+            self.current_index = index
+            self.update_position_label()
+            
+            # 滚动到对应的结果位置
+            if index < len(self.result_positions):
+                cursor = self.result_text.textCursor()
+                cursor.setPosition(self.result_positions[index])
+                self.result_text.setTextCursor(cursor)
+                self.result_text.ensureCursorVisible()
+            
+            # 发出信号，在主表格中选中对应的单元格
+            self.result_selected.emit(
+                result['cell_index'],
+                result['row_index'],
+                result['col_index']
+            )
+    
+    def update_position_label(self):
+        """更新位置标签"""
+        if self.results:
+            self.position_label.setText(f"{self.current_index + 1} / {len(self.results)}")
+        else:
+            self.position_label.setText("")
+    
+    def go_to_previous(self):
+        """跳转到上一个结果"""
+        if self.current_index > 0:
+            self.navigate_to_result(self.current_index - 1)
+    
+    def go_to_next(self):
+        """跳转到下一个结果"""
+        if self.current_index < len(self.results) - 1:
+            self.navigate_to_result(self.current_index + 1)
+
 def main():
     """主函数"""
-    print(f"\n{'='*60}")
-    print(f"启动 {APP_NAME} v{APP_VERSION}")
-    print(f"{'='*60}")
-    print(f"当前工作目录: {os.getcwd()}")
-    print(f"应用程序目录: {APP_DIR}")
-    print(f"数据库文件: {DB_FILE}")
-    print(f"备份目录: {BACKUP_DIR}")
-    print(f"配置文件: {CONFIG_FILE}")
-    print(f"{'='*60}\n")
-    
     app = MainApplication(sys.argv)
     
     if app.run():
-        print(f"\n{APP_NAME} 正常退出")
         sys.exit(app.exec())
     else:
-        print(f"\n{APP_NAME} 退出（用户取消登录）")
         sys.exit(0)
 
 
