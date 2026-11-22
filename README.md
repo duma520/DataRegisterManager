@@ -10,8 +10,6 @@
 
 <img width="1216" height="839" alt="image" src="https://github.com/user-attachments/assets/29829c66-8c61-4136-98ed-1a66e3679eb9" />
 
-
-
 ---
 
 # 《资料登记管理系统》完全用户指南
